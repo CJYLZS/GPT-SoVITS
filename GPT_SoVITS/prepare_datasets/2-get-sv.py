@@ -19,6 +19,7 @@ is_half = eval(os.environ.get("is_half", "True")) and torch.cuda.is_available()
 
 import traceback
 import torchaudio
+import soundfile as sf
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -89,7 +90,8 @@ def name2go(wav_name, wav_path):
     if os.path.exists(sv_cn_path):
         return
     wav_path = "%s/%s" % (wav32dir, wav_name)
-    wav32k, sr0 = torchaudio.load(wav_path)
+    wav32k, sr0 = sf.read(wav_path)
+    wav32k = torch.from_numpy(wav32k).float().unsqueeze(0)
     assert sr0 == 32000
     wav32k = wav32k.to(device)
     emb = sv.compute_embedding3(wav32k).cpu()  # torch.Size([1, 20480])

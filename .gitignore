@@ -7,6 +7,7 @@ runtime
 .idea
 output
 logs
+data
 SoVITS_weights*/
 GPT_weights*/
 TEMP

@@ -28,6 +28,7 @@ import sys
 import traceback
 import warnings
 
+import soundfile
 import torch
 import torchaudio
 from text.LangSegmenter import LangSegmenter
@@ -559,7 +560,8 @@ def get_spepc(hps, filename, dtype, device, is_v2pro=False):
     # audio = torch.FloatTensor(audio)
 
     sr1 = int(hps.data.sampling_rate)
-    audio, sr0 = torchaudio.load(filename)
+    _sf_audio, sr0 = soundfile.read(filename, dtype="float32", always_2d=True)
+    audio = torch.from_numpy(_sf_audio).transpose(0, 1)  # [samples, ch] -> [ch, samples]
     if sr0 != sr1:
         audio = audio.to(device)
         if audio.shape[0] == 2:
