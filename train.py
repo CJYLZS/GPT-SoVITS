@@ -11,6 +11,12 @@
 带增广（把片段压进 bucket0 并做变速，绕开 min_num=100 复制机制）:
     uv run python train.py --ref ... --name myvoice --augment
 
+源音频有残留背景音乐 -> 先用 UVR5 剥人声（vocal 阶段默认关闭）:
+    uv run python train.py --ref ... --name myvoice --augment --vocal
+
+源音频有持续环境底噪 -> 再叠 FRCRN 降噪（会降到 16kHz，慎用）:
+    uv run python train.py --ref ... --name myvoice --augment --vocal --denoise
+
 日志同时写到 logs/<name>/train.log。
 """
 
@@ -28,7 +34,20 @@ from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------- 常量
 
-ALL_STAGES = ["slice", "asr", "text", "ssl", "sv", "semantic", "s1", "s2"]
+ALL_STAGES = [
+    "vocal",
+    "denoise",
+    "slice",
+    "asr",
+    "text",
+    "ssl",
+    "sv",
+    "semantic",
+    "s1",
+    "s2",
+]
+# 默认不跑的阶段：需显式 --vocal / --denoise 开启（源音频干净时不该白跑）
+OPT_IN_STAGES = {"vocal", "denoise"}
 
 PRETRAIN = {
     "v2Pro": {
@@ -48,6 +67,7 @@ BERT_DIR = "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
 CNHUBERT_DIR = "GPT_SoVITS/pretrained_models/chinese-hubert-base"
 SV_CKPT = "GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
 G2PW_DIR = "GPT_SoVITS/text/G2PWModel"
+UVR5_WEIGHT_DIR = "tools/uvr5/uvr5_weights"
 
 # DistributedBucketSampler 的分桶边界（frames），hop_length=640 @ 32kHz → 1 frame = 20ms
 BUCKET_BOUNDS = [
@@ -227,6 +247,10 @@ class Cfg:
     lang: str = "zh"
     gpu: str = "0"
     augment: bool = False
+    vocal: bool = False
+    denoise: bool = False
+    uvr5_model: str = "HP5_only_main_vocal"
+    speeds: tuple[float, ...] = (0.9, 0.95, 1.0, 1.05, 1.1)
 
     # 切片
     threshold: int = -30
@@ -237,12 +261,21 @@ class Cfg:
 
     # 训练
     s1_batch: int = 6
-    s1_epochs: int = 12
-    s2_batch: int = 8
+    s1_epochs: int = 2
+    s2_batch: int = 4  # 6GB 显存下 8 会显存回退，见 --s2-batch 帮助
     s2_epochs: int = 10
-    save_every: int = 2
+    s1_save_every: int = 1
+    s2_save_every: int = 5
 
     stages: list[str] = field(default_factory=lambda: list(ALL_STAGES))
+
+    @property
+    def vocal_wav(self) -> str:
+        return f"data/voices/{self.name}_vocal.wav"
+
+    @property
+    def denoise_wav(self) -> str:
+        return f"data/voices/{self.name}_denoised.wav"
 
     @property
     def slice_dir(self) -> str:
@@ -351,11 +384,120 @@ def preflight(cfg: Cfg) -> None:
     )
 
 
+# ---------------------------------------------------------------- 阶段：人声分离
+
+
+def stage_vocal(cfg: Cfg) -> None:
+    """UVR5 剥离背景音乐/伴奏。针对的是残留 BGM，不是宽带底噪。"""
+    banner("Stage: 人声分离 (UVR5)")
+
+    ckpt = os.path.join(UVR5_WEIGHT_DIR, cfg.uvr5_model + ".pth")
+    alt = os.path.join(UVR5_WEIGHT_DIR, cfg.uvr5_model + ".ckpt")
+    if not (os.path.exists(ckpt) or os.path.exists(alt)):
+        avail = (
+            sorted(
+                os.path.splitext(f)[0]
+                for f in os.listdir(UVR5_WEIGHT_DIR)
+                if f.endswith((".pth", ".ckpt"))
+            )
+            if os.path.isdir(UVR5_WEIGHT_DIR)
+            else []
+        )
+        raise Fail(
+            f"UVR5 模型不存在: {cfg.uvr5_model}\n"
+            f"  已有: {avail or '（目录为空）'}\n"
+            f"  下载: bash install.sh --device CU128 --source HF --download-uvr5"
+        )
+
+    log.info(f"  模型 {cfg.uvr5_model}")
+    log.info(f"  输入 {cfg.ref}")
+    log.info("  只保留人声轨，伴奏轨丢弃")
+
+    run(
+        [
+            sys.executable,
+            "-s",
+            "tools/uvr5_cli.py",
+            "-i",
+            cfg.ref,
+            "-o",
+            cfg.vocal_wav,
+            "--model",
+            cfg.uvr5_model,
+            "--device",
+            f"cuda:{cfg.gpu}",
+        ],
+        stage="vocal",
+    )
+
+    if not os.path.exists(cfg.vocal_wav):
+        raise Fail(f"未产生人声文件: {cfg.vocal_wav}")
+    log.info(
+        f"  -> {cfg.vocal_wav} ({os.path.getsize(cfg.vocal_wav) / 1024 / 1024:.1f} MB)"
+    )
+    # 后续阶段一律读 cfg.ref，改指向让 vocal→denoise→slice 能串起来
+    cfg.ref = cfg.vocal_wav
+
+
+# ---------------------------------------------------------------- 阶段：降噪
+
+
+def stage_denoise(cfg: Cfg) -> None:
+    """FRCRN 降噪。注意输出被重采样到 16kHz，会牺牲高频。"""
+    banner("Stage: 语音降噪 (FRCRN)")
+    log.info(f"  输入 {cfg.ref}")
+    log.warning("  FRCRN 输出为 16kHz，高频信息会丢失（S2 训练目标是 32kHz）")
+
+    # cmd-denoise.py 只接受目录，包一层临时目录
+    tmp_in = f"TEMP/_denoise_in_{cfg.name}"
+    tmp_out = f"TEMP/_denoise_out_{cfg.name}"
+    shutil.rmtree(tmp_in, ignore_errors=True)
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    os.makedirs(tmp_in, exist_ok=True)
+    shutil.copy(cfg.ref, os.path.join(tmp_in, "input.wav"))
+
+    try:
+        run(
+            [
+                sys.executable,
+                "-s",
+                "tools/cmd-denoise.py",
+                "-i",
+                tmp_in,
+                "-o",
+                tmp_out,
+                "-p",
+                "float32",
+            ],
+            stage="denoise",
+        )
+
+        produced = (
+            [f for f in os.listdir(tmp_out) if f.endswith(".wav")]
+            if os.path.isdir(tmp_out)
+            else []
+        )
+        if not produced:
+            raise Fail(
+                f"降噪未产生输出于 {tmp_out}\n"
+                f"  模型走 ModelScope 的 damo/speech_frcrn_ans_cirm_16k，首次运行需联网下载"
+            )
+        shutil.move(os.path.join(tmp_out, produced[0]), cfg.denoise_wav)
+    finally:
+        shutil.rmtree(tmp_in, ignore_errors=True)
+        shutil.rmtree(tmp_out, ignore_errors=True)
+
+    log.info(
+        f"  -> {cfg.denoise_wav} ({os.path.getsize(cfg.denoise_wav) / 1024 / 1024:.1f} MB)"
+    )
+    cfg.ref = cfg.denoise_wav
+
+
 # ---------------------------------------------------------------- 阶段：切片
 
 
 def stage_slice(cfg: Cfg) -> None:
-    banner("Stage 1/8: 音频切片")
+    banner("Stage: 音频切片")
     os.makedirs(cfg.slice_dir, exist_ok=True)
     for f in os.listdir(cfg.slice_dir):
         os.remove(os.path.join(cfg.slice_dir, f))
@@ -414,17 +556,23 @@ def stage_slice(cfg: Cfg) -> None:
 
 
 def stage_augment(cfg: Cfg) -> None:
-    """错位子窗口 + 变速，把片段压进 bucket0 (0.64-6.00s) 并扩充样本数。
+    """纯变速增广，不做任何切割 —— 保证句子完整性。
 
-    只做 time_stretch（不改音高，音色不变），不做 pitch shift / 加噪 —— 那些会破坏音色目标。
+    历史教训：旧实现用固定 5.5s 滑动窗切片段（step=2.75s），窗边界落在原始采样点上，
+    与语音内容无关，于是大量片段在字/词中间被切断（观察到 "少女音就要带着音"、
+    "除了要练习情感以外，从" 这类残句）。残句教会 AR 模型"句子可以在任意位置结束"，
+    污染 EOS 分布，直接导致推理时吞字和提前截断。
+
+    现在只做 time_stretch：整条片段整体伸缩，不引入任何新的切点，
+    所以流程中唯一的切割来源是 slicer2 的静音检测。
+    time_stretch 不改音高，音色不变；不做 pitch shift / 加噪，那些会破坏音色目标。
     """
     import librosa
     import numpy as np
     import soundfile as sf
 
-    log.info("  增广: 错位子窗口 + 变速（目标 bucket0 = 0.64-6.00s）")
-    win_min, win_max, overlap = 3.0, 5.5, 0.5
-    speeds = [1.0, 0.95, 1.05]
+    speeds = cfg.speeds
+    log.info(f"  增广: 纯变速 {speeds}（不切割，保证句子完整）")
 
     bases = sorted(
         os.path.join(cfg.slice_dir, f)
@@ -436,36 +584,23 @@ def stage_augment(cfg: Cfg) -> None:
     os.makedirs(staging)
 
     n = 0
+    skipped = 0
     for bi, path in enumerate(bases):
         y, sr = librosa.load(path, sr=SR, mono=True)
-        dur = len(y) / sr
-        if dur <= win_max:
-            windows = [y] if dur >= 1.0 else []
-        else:
-            windows = []
-            step = int(win_max * sr * (1 - overlap))
-            pos = 0
-            while pos + int(win_min * sr) <= len(y):
-                seg = y[pos : pos + int(win_max * sr)]
-                if len(seg) / sr >= win_min:
-                    windows.append(seg)
-                pos += step
+        if len(y) / sr < 0.7:  # 太短，SSL/语义提取会失败
+            skipped += 1
+            continue
+        for sp in speeds:
+            s = y if sp == 1.0 else librosa.effects.time_stretch(y=y, rate=sp)
+            peak = float(np.abs(s).max())
+            if peak < 1e-4:
+                skipped += 1
+                continue
+            sf.write(f"{staging}/seg{bi:03d}_sp{int(sp * 100)}.wav", s / peak * 0.9, sr)
+            n += 1
 
-        for wi, seg in enumerate(windows):
-            for sp in speeds:
-                s = seg if sp == 1.0 else librosa.effects.time_stretch(y=seg, rate=sp)
-                d = len(s) / sr
-                if not (0.7 <= d <= 5.9):  # 严格锁在 bucket0 内，留安全边界
-                    continue
-                peak = float(np.abs(s).max())
-                if peak < 1e-4:
-                    continue
-                sf.write(
-                    f"{staging}/aug_{bi:03d}_{wi:02d}_sp{int(sp * 100)}.wav",
-                    s / peak * 0.9,
-                    sr,
-                )
-                n += 1
+    if skipped:
+        log.info(f"  跳过 {skipped} 条（过短或近似静音）")
 
     for f in os.listdir(cfg.slice_dir):
         os.remove(os.path.join(cfg.slice_dir, f))
@@ -482,7 +617,7 @@ def stage_augment(cfg: Cfg) -> None:
 
 
 def stage_asr(cfg: Cfg) -> None:
-    banner("Stage 2/8: ASR 转写")
+    banner("Stage: ASR 转写")
     if dir_count(cfg.slice_dir, ".wav") == 0:
         raise Fail(f"{cfg.slice_dir} 无切片，先跑 slice 阶段")
 
@@ -561,7 +696,7 @@ def prep_env(cfg: Cfg) -> dict[str, str]:
 
 
 def stage_text(cfg: Cfg) -> None:
-    banner("Stage 3/8: 文本 -> 音素 + BERT 特征")
+    banner("Stage: 文本 -> 音素 + BERT 特征")
     if not os.path.exists(cfg.list_file):
         raise Fail(f"标注文件不存在: {cfg.list_file}，先跑 asr 阶段")
 
@@ -589,7 +724,7 @@ def stage_text(cfg: Cfg) -> None:
 
 
 def stage_ssl(cfg: Cfg) -> None:
-    banner("Stage 4/8: 音频 -> SSL 特征 + 32kHz 重采样")
+    banner("Stage: 音频 -> SSL 特征 + 32kHz 重采样")
     env = prep_env(cfg) | {"cnhubert_base_dir": CNHUBERT_DIR}
     run(
         [sys.executable, "-s", "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"],
@@ -609,7 +744,7 @@ def stage_ssl(cfg: Cfg) -> None:
 
 
 def stage_sv(cfg: Cfg) -> None:
-    banner("Stage 5/8: 音频 -> 说话人向量（v2Pro 系列必需）")
+    banner("Stage: 音频 -> 说话人向量（v2Pro 系列必需）")
     if cfg.version not in ("v2Pro", "v2ProPlus"):
         log.info("  非 v2Pro 系列，跳过")
         return
@@ -634,7 +769,7 @@ def stage_sv(cfg: Cfg) -> None:
 
 
 def stage_semantic(cfg: Cfg) -> None:
-    banner("Stage 6/8: SSL -> 语义 token")
+    banner("Stage: SSL -> 语义 token")
     p = PRETRAIN[cfg.version]
     env = prep_env(cfg) | {"pretrained_s2G": p["s2G"], "s2config_path": p["s2_config"]}
     run(
@@ -701,7 +836,7 @@ def verify_alignment(cfg: Cfg) -> None:
 
 
 def stage_s1(cfg: Cfg) -> None:
-    banner("Stage 7/8: GPT (S1) 训练")
+    banner("Stage: GPT (S1) 训练")
     import yaml
 
     sem = f"{cfg.opt_dir}/6-name2semantic.tsv"
@@ -716,7 +851,7 @@ def stage_s1(cfg: Cfg) -> None:
         {
             "batch_size": cfg.s1_batch,
             "epochs": cfg.s1_epochs,
-            "save_every_n_epoch": cfg.save_every,
+            "save_every_n_epoch": cfg.s1_save_every,
             "if_save_every_weights": True,
             "if_save_latest": True,
             "if_dpo": False,
@@ -734,7 +869,7 @@ def stage_s1(cfg: Cfg) -> None:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
     log.info(
-        f"  batch_size={cfg.s1_batch} epochs={cfg.s1_epochs} save_every={cfg.save_every}"
+        f"  batch_size={cfg.s1_batch} epochs={cfg.s1_epochs} save_every={cfg.s1_save_every}"
     )
     log.info(f"  底模 {S1_CKPT}")
     log.info(
@@ -760,7 +895,7 @@ def stage_s1(cfg: Cfg) -> None:
 
 
 def stage_s2(cfg: Cfg) -> None:
-    banner("Stage 8/8: SoVITS (S2) 训练")
+    banner("Stage: SoVITS (S2) 训练")
     p = PRETRAIN[cfg.version]
     with open(p["s2_config"], encoding="utf-8") as f:
         data = json.load(f)
@@ -769,7 +904,7 @@ def stage_s2(cfg: Cfg) -> None:
         {
             "batch_size": cfg.s2_batch,
             "epochs": cfg.s2_epochs,
-            "save_every_epoch": cfg.save_every,
+            "save_every_epoch": cfg.s2_save_every,
             "if_save_latest": False,
             "if_save_every_weights": True,
             "gpu_numbers": cfg.gpu,
@@ -792,7 +927,7 @@ def stage_s2(cfg: Cfg) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     log.info(
-        f"  batch_size={cfg.s2_batch} epochs={cfg.s2_epochs} save_every={cfg.save_every}"
+        f"  batch_size={cfg.s2_batch} epochs={cfg.s2_epochs} save_every={cfg.s2_save_every}"
     )
     log.info(f"  底模 G={p['s2G']}")
     log.info(f"       D={p['s2D']}")
@@ -816,6 +951,8 @@ def stage_s2(cfg: Cfg) -> None:
 # ---------------------------------------------------------------- 入口
 
 STAGE_FN = {
+    "vocal": stage_vocal,
+    "denoise": stage_denoise,
     "slice": stage_slice,
     "asr": stage_asr,
     "text": stage_text,
@@ -845,12 +982,33 @@ def main() -> None:
     ap.add_argument(
         "--augment",
         action="store_true",
-        help="启用增广（压进 bucket0 + 变速），绕开 min_num=100 复制机制",
+        help="启用变速增广（不切割，保证句子完整），绕开 min_num=100 复制机制",
+    )
+    ap.add_argument(
+        "--speeds",
+        default="0.9,0.95,1.0,1.05,1.1",
+        help="变速档位，逗号分隔（默认 0.9,0.95,1.0,1.05,1.1）",
+    )
+    ap.add_argument(
+        "--vocal",
+        action="store_true",
+        help="切片前用 UVR5 剥离背景音乐（源音频有残留 BGM 时用）",
+    )
+    ap.add_argument(
+        "--uvr5-model",
+        default="HP5_only_main_vocal",
+        help="UVR5 模型名。HP5_only_main_vocal=仅保留主人声，HP2_all_vocals=保留和声，VR-DeEcho*=去混响",
+    )
+    ap.add_argument(
+        "--denoise",
+        action="store_true",
+        help="切片前用 FRCRN 降噪（注意输出降为 16kHz，会丢高频）",
     )
     ap.add_argument(
         "--stages",
         default="all",
-        help=f"要执行的阶段，逗号分隔。可选: {','.join(ALL_STAGES)}",
+        help=f"要执行的阶段，逗号分隔。可选: {','.join(ALL_STAGES)}"
+        f"（{'/'.join(sorted(OPT_IN_STAGES))} 默认不跑，需配 --vocal / --denoise）",
     )
 
     g = ap.add_argument_group("切片参数")
@@ -867,23 +1025,37 @@ def main() -> None:
     g = ap.add_argument_group("训练参数")
     g.add_argument("--s1-batch", type=int, default=6)
     g.add_argument("--s1-epochs", type=int, default=12)
-    g.add_argument("--s2-batch", type=int, default=8)
+    g.add_argument(
+        "--s2-batch",
+        type=int,
+        default=4,
+        help="6GB 显存下 8 会触发显存回退（实测 40s→320s/step），默认 4",
+    )
     g.add_argument("--s2-epochs", type=int, default=10)
     g.add_argument(
-        "--save-every", type=int, default=2, help="每几轮保存（小数据集建议 2）"
+        "--s1-save-every", type=int, default=1, help="S1 每几轮保存（默认 1）"
+    )
+    g.add_argument(
+        "--s2-save-every", type=int, default=5, help="S2 每几轮保存（默认 5）"
     )
 
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
     args = ap.parse_args()
 
-    stages = (
-        ALL_STAGES
-        if args.stages == "all"
-        else [s.strip() for s in args.stages.split(",")]
-    )
-    bad = [s for s in stages if s not in ALL_STAGES]
-    if bad:
-        sys.exit(f"error: 未知阶段 {bad}，可选: {','.join(ALL_STAGES)}")
+    if args.stages == "all":
+        # opt-in 阶段只在对应开关打开时才进入 all
+        enabled = {"vocal": args.vocal, "denoise": args.denoise}
+        stages = [
+            s for s in ALL_STAGES if s not in OPT_IN_STAGES or enabled.get(s, False)
+        ]
+    else:
+        stages = [s.strip() for s in args.stages.split(",")]
+        bad = [s for s in stages if s not in ALL_STAGES]
+        if bad:
+            sys.exit(f"error: 未知阶段 {bad}，可选: {','.join(ALL_STAGES)}")
+        # 显式点名 vocal/denoise 时视同打开开关
+        args.vocal = args.vocal or "vocal" in stages
+        args.denoise = args.denoise or "denoise" in stages
 
     cfg = Cfg(
         ref=args.ref,
@@ -892,6 +1064,10 @@ def main() -> None:
         lang=args.lang,
         gpu=args.gpu,
         augment=args.augment,
+        vocal=args.vocal,
+        denoise=args.denoise,
+        uvr5_model=args.uvr5_model,
+        speeds=tuple(float(s) for s in args.speeds.split(",") if s.strip()),
         threshold=args.threshold,
         min_length=args.min_length,
         min_interval=args.min_interval,
@@ -900,17 +1076,28 @@ def main() -> None:
         s1_epochs=args.s1_epochs,
         s2_batch=args.s2_batch,
         s2_epochs=args.s2_epochs,
-        save_every=args.save_every,
+        s1_save_every=args.s1_save_every,
+        s2_save_every=args.s2_save_every,
         stages=stages,
     )
 
     os.makedirs(cfg.opt_dir, exist_ok=True)
     setup_logging(f"{cfg.opt_dir}/train.log", args.verbose)
 
+    # 只跑后段阶段（如 --stages slice,asr）时，前置产物已在磁盘上，
+    # 需手动把 ref 前推到最后一个已完成的预处理产物，否则会退回读原始带噪音频
+    if "vocal" not in stages and cfg.vocal and os.path.exists(cfg.vocal_wav):
+        cfg.ref = cfg.vocal_wav
+    if "denoise" not in stages and cfg.denoise and os.path.exists(cfg.denoise_wav):
+        cfg.ref = cfg.denoise_wav
+
     log.info(f"实验    : {cfg.name}")
     log.info(f"版本    : {cfg.version}")
     log.info(f"阶段    : {' -> '.join(stages)}")
     log.info(f"增广    : {'开' if cfg.augment else '关'}")
+    log.info(f"人声分离: {cfg.uvr5_model if cfg.vocal else '关'}")
+    log.info(f"降噪    : {'开' if cfg.denoise else '关'}")
+    log.info(f"输入音频: {cfg.ref}")
     log.info(f"日志    : {cfg.opt_dir}/train.log")
 
     t0 = time.time()

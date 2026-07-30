@@ -42,7 +42,8 @@ Two wrappers exist so you don't have to hand-assemble the env-var-only `prepare_
 
 #### `train.py` — end-to-end finetune driver
 
-Pipeline: `slice → asr → text → ssl → sv → semantic → s1 → s2`.
+Pipeline: `[vocal] → [denoise] → slice → asr → text → ssl → sv → semantic → s1 → s2`.
+`vocal` (UVR5) and `denoise` are opt-in (`OPT_IN_STAGES`) — they need `--vocal` / `--denoise`, or naming them in `--stages`.
 
 ```bash
 # Full run with defaults (v2Pro, Chinese, GPU 0)
@@ -68,9 +69,11 @@ uv run python train.py --ref data/voices/ref.wav --name myvoice \
 uv run python train.py --ref data/voices/ref.wav --name myvoice \
     --threshold -30 --min-length 4000 --min-interval 600 --max-sil-kept 800
 
-# Tune training (defaults: s1 6/12, s2 8/10, save-every 2)
+# Tune training. Defaults: s1 batch 6 / 2 epochs / save every 1,
+# s2 batch 4 / 10 epochs / save every 5. On 6GB VRAM keep both batches <= 4.
 uv run python train.py --ref data/voices/ref.wav --name myvoice \
-    --s1-batch 6 --s1-epochs 12 --s2-batch 8 --s2-epochs 10 --save-every 2
+    --s1-batch 4 --s1-epochs 30 --s1-save-every 5 \
+    --s2-batch 4 --s2-epochs 20 --s2-save-every 5
 ```
 
 Paths are all derived from `--name`: clips in `data/voices/<name>_sliced/`, annotations at `data/voices/<name>.list`, features under `logs/<name>/`, weights in `GPT_weights_<version>/` and `SoVITS_weights_<version>/`. Logs go to both stdout and `logs/<name>/train.log`.
@@ -111,6 +114,54 @@ uv run python infer.py -t "测试文本" -o out.wav \
 ```
 
 `--lang` / `--ref-lang` take the Chinese literals (`中文`, `英文`, `日文`, `粤语`, `韩文`, `中英混合`, `多语种混合`) because the script forces `language=zh_CN` — see the `dict_language` gotcha below.
+
+### Packaging a trained voice for reuse
+
+Ship a self-contained bundle so a finished voice can be re-used without re-running the pipeline. Layout that `infer.py` consumes directly:
+
+```
+girlish_v2Pro/
+├── README.md
+├── gpt/      girlish-e15.ckpt  girlish-e20.ckpt  girlish-e30.ckpt   (149M each)
+├── sovits/   girlish_e15_s330.pth  girlish_e20_s440.pth             (129M each)
+└── ref/      6 clips spanning different deliveries + ref.list
+```
+
+Only ship the checkpoints worth A/B-ing (skip under-trained early epochs); each GPT is 149M and each SoVITS 129M, so pruning matters. GPT and SoVITS are independent — any pair works.
+
+**Ship several reference clips, not one.** The reference sets the *emotion and delivery*, not just the timbre, so a single narration-style clip locks every output into that register. Pick clips covering the registers you'll actually need (narration / gentle / laughing / questioning / …), name them with their duration, and keep every one inside the 3–10s limit.
+
+`ref/ref.list` carries the transcripts in standard 4-field format (`path|speaker|LANG|text`) with **paths relative to the bundle root**, so `--list` auto-looks-up the reference text after extraction:
+
+```bash
+uv run python infer.py \
+  --gpt    girlish_v2Pro/gpt/girlish-e30.ckpt \
+  --sovits girlish_v2Pro/sovits/girlish_e15_s330.pth \
+  --ref    girlish_v2Pro/ref/01_解说_8.8s.wav \
+  --list   girlish_v2Pro/ref/ref.list \
+  -t "要合成的文本" -o out.wav
+```
+
+Build the zip with Python — **`zip`/`unzip` are not installed** on this host. Store the weights uncompressed; they're already-compressed binaries, so deflate burns minutes for ~1%:
+
+```bash
+cd /tmp/opencode/pkg && python3 - <<'EOF'
+import zipfile, os
+out = "/home/rookie/voice/girlish_v2Pro.zip"
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+    for root, _, files in os.walk("girlish_v2Pro"):
+        for fn in sorted(files):
+            p = os.path.join(root, fn)
+            z.write(p, p, compress_type=zipfile.ZIP_STORED if fn.endswith((".ckpt", ".pth")) else zipfile.ZIP_DEFLATED)
+print(f"{os.path.getsize(out) / 1024 / 1024:.0f} MB")
+EOF
+```
+
+Before zipping, copy the staged dir somewhere else and run one synthesis through the in-bundle relative paths — that is what catches a broken `ref.list`. Verify afterwards with `zipfile.ZipFile(...).testzip()`.
+
+The bundle deliberately **excludes pretrained models**. The target host still needs `GPT_SoVITS/pretrained_models/` (s1v3, chinese-hubert-base, chinese-roberta-wwm-ext-large, `sv/`, `v2Pro/`) plus `GPT_SoVITS/text/G2PWModel` for Chinese. Say so in the bundle README.
+
+`infer.py`'s `DEFAULT_GPT`/`DEFAULT_SOVITS`/`DEFAULT_REF`/`DEFAULT_LIST` are hardcoded to one specific voice and **go stale whenever old weights are deleted**. Re-point them after training a new voice, or the no-argument invocation breaks.
 
 ### Ports
 
@@ -173,6 +224,9 @@ Pretrained weights, G2PWModel, UVR5 weights, and other assets must be downloaded
 - **`transformers>=4.57` needed for Fun-ASR-Nano**: The default ASR backend uses Fun-ASR-Nano which internally needs Qwen3 support (added in transformers 4.57). Upgrade if ASR fails with `KeyError: 'qwen3'`.
 - **`torchaudio.load()` may fail via torchcodec.** torchaudio 2.11 routes `load()` through torchcodec, which needs CUDA-12 NPP libs (`libnppicc.so.12`). If the host only has CUDA 13, this raises `OSError`. Symlinking `.so.13` as `.so.12` does **not** work (symbol version mismatch). Workaround used here: replace `torchaudio.load()` with `soundfile.read()` (patched in `prepare_datasets/2-get-sv.py` and `inference_webui.py:get_spepc`). Note `sf.read` returns `[samples, ch]` — transpose to `[ch, samples]`. Training data loading is unaffected (`tools/my_utils.load_audio` shells out to ffmpeg).
 - **Create weight output dirs before training.** `logs_s2_*`/`logs_s1_*` missing → first `save_checkpoint` crashes. `SoVITS_weights_*`/`GPT_weights_*` missing → `process_ckpt.savee()` fails *silently* (G/D checkpoints land fine, but the small inference weights never appear).
+- **Reference audio must be 3–10s or inference dies.** `inference_webui.py:857` raises `OSError: 参考音频在3~10秒范围外，请更换！`. Slice filenames encode sample offsets at the *source* rate, so the implied duration does not match the resampled file — always confirm with `ffprobe -show_entries format=duration` instead of doing arithmetic on the filename.
+- **Hand-edited ASR transcripts must land in `data/voices/<name>.list`.** `stage_asr` writes its raw output to `data/voices/<name>_asr/<name>_sliced.list` and then copies a filtered version to `data/voices/<name>.list`; the `text` stage reads **only** the latter. Editing the `_asr/` copy has no effect and silently trains on uncorrected text.
+- **The ONNX `libcublasLt.so.12` error during inference is harmless.** G2PW's CUDA provider fails to load and falls back to CPU; audio is still produced. Do not chase it.
 
 ## Small-dataset training gotchas (source-verified)
 

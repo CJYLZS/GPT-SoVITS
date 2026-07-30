@@ -22,12 +22,22 @@ import argparse
 import os
 import sys
 
-DEFAULT_GPT = "GPT_weights_v2Pro/girlish_voice-e20.ckpt"
-DEFAULT_SOVITS = "SoVITS_weights_v2Pro/girlish_voice_e20_s120.pth"
-DEFAULT_REF = "data/voices/girlish_voice_sliced/ref.wav_0000000000_0000181760.wav"
-DEFAULT_LIST = "data/voices/girlish_voice.list"
+DEFAULT_GPT = "GPT_weights_v2Pro/girlish-e30.ckpt"
+DEFAULT_SOVITS = "SoVITS_weights_v2Pro/girlish_e15_s330.pth"
+DEFAULT_REF = "data/voices/girlish_sliced/ref-vocal.wav_0004307200_0004589760.wav"
+DEFAULT_LIST = "data/voices/girlish.list"
 
 LANG_CHOICES = ["中文", "英文", "日文", "粤语", "韩文", "中英混合", "多语种混合"]
+
+# inference_webui.py:872-881 用这些中文字面量做分支判断（infer.py 强制 language=zh_CN）
+CUT_CHOICES = [
+    "不切",
+    "凑四句一切",
+    "凑50字一切",
+    "按中文句号。切",
+    "按英文句号.切",
+    "按标点符号切",
+]
 
 
 def lookup_ref_text(ref_wav: str, list_file: str) -> str | None:
@@ -79,6 +89,13 @@ def main() -> None:
     p.add_argument(
         "--ref-lang", default="中文", choices=LANG_CHOICES, help="参考音频语言"
     )
+    p.add_argument(
+        "--cut",
+        default="按中文句号。切",
+        choices=CUT_CHOICES,
+        help="长文本切分方式。AR 生成上限 1500 步（t2s_model.py:533），"
+        "整段长文本不切会被静默截断（默认 按中文句号。切）",
+    )
     p.add_argument("--top-k", type=int, default=15)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -127,6 +144,7 @@ def main() -> None:
     print(f"Ref    : {os.path.basename(args.ref)}")
     print(f"RefText: {ref_text[:50]}{'...' if len(ref_text) > 50 else ''}")
     print(f"Text   : {len(target_text)} 字")
+    print(f"Cut    : {args.cut}")
 
     change_gpt_weights(gpt_path=args.gpt)
     change_sovits_weights(sovits_path=args.sovits)
@@ -138,6 +156,7 @@ def main() -> None:
             prompt_language=args.ref_lang,
             text=target_text,
             text_language=args.lang,
+            how_to_cut=args.cut,
             top_k=args.top_k,
             top_p=args.top_p,
             temperature=args.temperature,
